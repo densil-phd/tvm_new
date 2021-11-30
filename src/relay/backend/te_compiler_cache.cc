@@ -119,45 +119,141 @@ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>
     // Whether to use auto_scheduler schedule.
     use_auto_scheduler_ = backend::IsAutoSchedulerEnabled();
     use_meta_schedule_ = backend::IsMetaScheduleEnabled();
+    use_alt_ = backend::IsALTEnabled();
   }
 
   CachedFunc Create(const Function& relay_func, std::function<std::string(std::string)> renamer) {
+    // Array<tvm::te::Tensor> fn_inputs;
+    // for (Var param : relay_func->params) {
+    //   Array<tvm::te::Tensor> inputs;
+    //   for (const auto& ttype : FlattenTupleType(param->checked_type())) {
+    //     tvm::te::Tensor tensor = tvm::te::placeholder(GetShape(ttype->shape), ttype->dtype);
+    //     fn_inputs.push_back(tensor);
+    //     inputs.push_back(tensor);
+    //   }
+    //   memo_[param] = inputs;
+    // }
+    // readable_name_stream_ << "fused";
+    // auto outputs = this->VisitExpr(relay_func->body);
+    // auto candidate_name = readable_name_stream_.str();
+    // constexpr static size_t kMaxFuncNameLength = 80;
+    // // WARNING: Please make sure to also update TVM_CRT_MAX_STRLEN_FUNCTION_NAME
+    // //          whenever the value of kMaxFuncNameLength changes
+    // if (candidate_name.size() > kMaxFuncNameLength) {
+    //   std::stringstream truncated_name;
+    //   truncated_name << candidate_name.substr(0, kMaxFuncNameLength);
+    //   truncated_name << "_" << std::hash<std::string>{}(candidate_name) << "_";
+    //   candidate_name = truncated_name.str();
+    // }
+
+    // // NB(@jroesch): unfortunately the graph runtime deals with copy in
+    // // a totally hacky way, we really need to rectify this but this will
+    // // have to work for now.
+    // std::string prim_fn_name = candidate_name;
+    // if (prim_fn_name != "__copy") {
+    //   prim_fn_name = renamer(prim_fn_name);
+    // }
+    // auto prim_fn_var = GlobalVar(prim_fn_name);
+    // prim_fn_var->checked_type_ = relay_func->checked_type();
+
+    // // Fusion over tupled results may leave identity relationships
+    // // between inputs and outputs, and those should not be scheduled.
+    // // Hence schedule only non PlaceholderOp outputs.
+    // tvm::Array<te::Tensor> tensor_outs;
+    // for (const auto& tensor : outputs) {
+    //   if (!tensor->op.as<te::PlaceholderOpNode>()) {
+    //     tensor_outs.push_back(tensor);
+    //   }
+    // }
+
+    // te::Schedule schedule{nullptr};
+    // tir::PrimFunc prim_func{nullptr};
+    // // No need to register schedule for device copy op.
+    // if (anchor_attrs_.as<DeviceCopyAttrs>() == nullptr && create_schedule_) {
+    //   if (use_auto_scheduler_) {
+    //     const auto* fauto_schedule =
+    //         runtime::Registry::Get("auto_scheduler.relay_integration.auto_schedule_topi_compute");
+    //     ICHECK(fauto_schedule != nullptr)
+    //         << "auto_scheduler.relay_integration.auto_schedule_topi_compute is not registered";
+    //     ObjectRef obj = (*fauto_schedule)(prim_fn_name, tensor_outs);
+    //     if (obj.defined()) {
+    //       schedule = Downcast<te::Schedule>(obj);
+    //     }
+    //   }
+    //   if (use_meta_schedule_) {
+    //     const auto* f_create_func = runtime::Registry::Get("te.CreatePrimFuncFromOutputs");
+    //     const auto* f_meta_schedule =
+    //         runtime::Registry::Get("meta_schedule.MetaScheduleContextQueryInsideWithScope");
+    //     ICHECK(f_create_func) << "te.CreatePrimFuncFromOutputs is not registered";
+    //     ICHECK(f_meta_schedule)
+    //         << "meta_schedule.MetaScheduleContextQueryInsideWithScope is not registered";
+    //     prim_func = (*f_create_func)(tensor_outs);
+    //     Optional<ObjectRef> opt_mod_or_base_func =
+    //         (*f_meta_schedule)(prim_fn_name, IRModule({{GlobalVar(prim_fn_name), relay_func}}),
+    //                            Array<IRModule>{IRModule({{GlobalVar(prim_fn_name), prim_func}})});
+    //     if (const auto* result = opt_mod_or_base_func.as<tir::PrimFuncNode>()) {
+    //       prim_func = GetRef<tir::PrimFunc>(result);
+    //     } else {
+    //       prim_func = tir::PrimFunc(nullptr);
+    //     }
+    //   }
+
+    //   // Use TOPI schdule if user specificed, or the function has no auto_scheduler schedule.
+    //   if (!schedule.defined() && !prim_func.defined()) {
+    //     ICHECK(anchor_implementation_.defined());
+    //     schedule = anchor_implementation_.Schedule(anchor_attrs_, tensor_outs, target_);
+    //   }
+    //   if (schedule.defined()) {
+    //     for (const auto& scalar : scalars_) {
+    //       if (schedule->Contain(scalar)) {
+    //         schedule[scalar].compute_inline();
+    //       }
+    //     }
+    //   }
+    // }
+
+    // return CachedFunc(target_, prim_fn_var, fn_inputs, outputs, schedule, prim_func, {});
+    auto cache_node = make_object<CachedFuncNode>();
+    // cache_node->target = target_;
     Array<tvm::te::Tensor> fn_inputs;
     for (Var param : relay_func->params) {
       Array<tvm::te::Tensor> inputs;
-      for (const auto& ttype : FlattenTupleType(param->checked_type())) {
+      if (const auto* ttype = param->checked_type().as<TensorTypeNode>()) {
         tvm::te::Tensor tensor = tvm::te::placeholder(GetShape(ttype->shape), ttype->dtype);
         fn_inputs.push_back(tensor);
         inputs.push_back(tensor);
+      } else {
+        // flatten tuple of tensor type.
+        const auto* tuple_type = param->type_as<TupleTypeNode>();
+        for (Type field : tuple_type->fields) {
+          const auto* ttype = field.as<TensorTypeNode>();
+          // TODO(@icemelon): Allow recursive tuple
+          ICHECK(ttype != nullptr);
+          tvm::te::Tensor tensor = tvm::te::placeholder(GetShape(ttype->shape), ttype->dtype);
+          fn_inputs.push_back(tensor);
+          inputs.push_back(tensor);
+        }
       }
       memo_[param] = inputs;
     }
+    
     readable_name_stream_ << "fused";
     auto outputs = this->VisitExpr(relay_func->body);
     auto candidate_name = readable_name_stream_.str();
     constexpr static size_t kMaxFuncNameLength = 80;
-    // WARNING: Please make sure to also update TVM_CRT_MAX_STRLEN_FUNCTION_NAME
-    //          whenever the value of kMaxFuncNameLength changes
     if (candidate_name.size() > kMaxFuncNameLength) {
       std::stringstream truncated_name;
       truncated_name << candidate_name.substr(0, kMaxFuncNameLength);
       truncated_name << "_" << std::hash<std::string>{}(candidate_name) << "_";
       candidate_name = truncated_name.str();
     }
-
-    // NB(@jroesch): unfortunately the graph runtime deals with copy in
-    // a totally hacky way, we really need to rectify this but this will
-    // have to work for now.
     std::string prim_fn_name = candidate_name;
     if (prim_fn_name != "__copy") {
       prim_fn_name = renamer(prim_fn_name);
     }
     auto prim_fn_var = GlobalVar(prim_fn_name);
     prim_fn_var->checked_type_ = relay_func->checked_type();
-
-    // Fusion over tupled results may leave identity relationships
-    // between inputs and outputs, and those should not be scheduled.
-    // Hence schedule only non PlaceholderOp outputs.
+    ICHECK(anchor_op_.defined());
     tvm::Array<te::Tensor> tensor_outs;
     for (const auto& tensor : outputs) {
       if (!tensor->op.as<te::PlaceholderOpNode>()) {
@@ -178,6 +274,21 @@ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>
         if (obj.defined()) {
           schedule = Downcast<te::Schedule>(obj);
         }
+      }else if (use_alt_){
+        const auto* falt_schedule =
+          runtime::Registry::Get("auto_scheduler.relay_integration.alt_topi_compute");
+        const auto* falt_task_key = 
+          runtime::Registry::Get("auto_scheduler.relay_integration.alt_task_key");
+        ICHECK(falt_schedule != nullptr)
+            << "auto_scheduler.relay_integration.alt_topi_compute is not registered";
+        // LOG(INFO) << "calling falt task key func...\n";
+        const std::string task_key = (*falt_task_key)(tensor_outs);
+        // LOG(INFO) << "task key: " << task_key << std::endl;
+        // cache_node->task_key = task_key;
+        ObjectRef obj = (*falt_schedule)(tensor_outs);
+        // if (obj.defined()) {
+        schedule = Downcast<te::Schedule>(obj);
+        // }
       }
       if (use_meta_schedule_) {
         const auto* f_create_func = runtime::Registry::Get("te.CreatePrimFuncFromOutputs");
@@ -196,7 +307,6 @@ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>
           prim_func = tir::PrimFunc(nullptr);
         }
       }
-
       // Use TOPI schdule if user specificed, or the function has no auto_scheduler schedule.
       if (!schedule.defined() && !prim_func.defined()) {
         ICHECK(anchor_implementation_.defined());
@@ -210,7 +320,6 @@ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>
         }
       }
     }
-
     return CachedFunc(target_, prim_fn_var, fn_inputs, outputs, schedule, prim_func, {});
   }
 
@@ -359,6 +468,7 @@ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>
   Array<te::Operation> scalars_;
   bool use_auto_scheduler_;
   bool use_meta_schedule_;
+  bool use_alt_;
   // Cache device copy op for equivalence checking to reduce registry lookup
   // overhead for each invocation of call node when retrieving schedules.
   const Op& device_copy_op_;

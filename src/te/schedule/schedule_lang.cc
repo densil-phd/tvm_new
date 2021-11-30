@@ -797,6 +797,7 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
     .set_dispatch<FuseNode>([](const ObjectRef& node, ReprPrinter* p) {
       auto* op = static_cast<const FuseNode*>(node.get());
       p->stream << "fuse(";
+      // p->stream << "split(";
       p->stream << "outer=";
       p->Print(op->outer);
       p->stream << ", inner=";
@@ -924,6 +925,315 @@ TVM_REGISTER_GLOBAL("te.EnterSpecializationScope")
 
 TVM_REGISTER_GLOBAL("te.ExitSpecializationScope")
     .set_body_typed(SpecializedCondition::Internal::ExitScope);
+// customized start from here
+
+void SyncStageWithStageMap(Schedule sch){
+  while(!sch->stage_map.empty()){
+    sch->stage_map.erase((*sch->stage_map.begin()).first);
+  }
+  for(auto stg: sch->stages){
+    sch->stage_map.Set(stg->op, stg);
+    stg->origin_op = stg->op;
+  }
+  // sync other fields
+  Array<Operation> & outputs = sch->outputs;
+  Array<Stage> & groups = sch->groups;
+  for(const auto &stg: sch->stages){
+    for(std::size_t i = 0; i < outputs.size(); i++){
+      const std::string name = outputs[i]->name;
+      if(stg->op->name == name){
+        outputs.Set(i, stg->op);
+        break;
+      }
+    }
+    for(std::size_t i = 0; i < groups.size(); i++){
+      const std::string name = groups[i]->op->name;
+      if(stg->op->name == name){
+        groups.Set(i, stg);
+        break;
+      }
+    }
+  }
+}
+
+TVM_REGISTER_GLOBAL("te.SyncStageWithStageMap").set_body_typed([](Schedule s){
+  SyncStageWithStageMap(s);
+});
+
+void ReplaceDataFlowCopy(Schedule &sch, const Array<Stage>& stages, std::unordered_map<Tensor, Tensor>* vmap,
+                     std::unordered_map<Tensor, Tensor>* rvmap) {
+  for (Stage s : stages) {
+    Operation op = s->op->ReplaceInputs(s->op, *vmap);
+    if (!op.same_as(s->op)) {
+      for (int i = 0; i < op->num_outputs(); ++i) {
+        auto it = rvmap->find(s->op.output(i));
+        if (it != rvmap->end()) {
+          (*vmap)[it->second] = op.output(i);
+        } else {
+          (*vmap)[s->op.output(i)] = op.output(i);
+          (*rvmap)[op.output(i)] = s->op.output(i);
+        }
+      }
+      s->op = op;
+      sch->stage_map.Set(op, s);
+    }
+  }
+}
+
+Operation Schedule::ReplaceInputs(Operation op, Map<Tensor, Tensor> user_vmap, bool is_output){
+    std::unordered_map<Tensor, Tensor> vsub;
+    for(auto& kv: user_vmap){
+      vsub[kv.first] = kv.second;
+    }
+    std::unordered_map<Tensor, Tensor> vmap;
+    std::unordered_map<Tensor, Tensor> rvmap;
+
+    Stage s = this->operator[](op);
+    Operation repl_op = s->op->ReplaceInputs(s->op, vsub);
+    vmap[s->op.output(0)] = repl_op.output(0);
+    rvmap[repl_op.output(0)] = s->op.output(0);
+    s->op = repl_op;
+    ReplaceDataFlowCopy((*this), (*this)->stages, &vmap, &rvmap);
+    //redirect repl_op to stage s
+    (*this)->stage_map.erase(op);
+    (*this)->stage_map.Set(repl_op, s);
+    if (is_output){
+      ScheduleNode * n = (*this).operator->();
+      for(Stage orig_s: (*this)->stages){
+        orig_s->is_output = false;
+      }
+      s->is_output = true;
+      size_t i = 0;
+      for(; i < n->outputs.size(); i++){
+        if(n->outputs[i] == op){
+          break;
+        }
+      }
+      n->outputs.Set(i, repl_op);
+    }
+  // }
+  return repl_op;
+}
+
+TVM_REGISTER_GLOBAL("te.ReplaceInputs").set_body_typed([](Schedule s, Operation op, Map<Tensor, Tensor> vmap, bool is_output){
+  return s.ReplaceInputs(op, vmap, is_output);
+});
+
+void Schedule::AddOperation(Operation new_op, int pos, bool is_output){
+  ScheduleNode* n = (*this).operator->();
+  Stage new_stage(new_op);
+  if(is_output){
+    n->outputs = Array<Operation>({new_op});
+    for(auto it=n->stages.begin(); it!=n->stages.end(); ++it){
+      Stage s = *it;
+      s->is_output = false;
+    }
+    new_stage->is_output = true;
+  }
+  if(pos >= 0){
+    n->stages.insert(n->stages.begin() + pos, new_stage);
+  }else if(pos == -1){
+    n->stages.push_back(new_stage);
+  }
+  // ZYX: stage_map is an unordered_map, so, pos will not influence this
+  n->stage_map.Set(new_op, new_stage);
+
+  // ZYX: I will not use this, actually. You do NOT use this either..
+  if (const ScanOpNode* scan = new_op.as<ScanOpNode>()) {
+    Array<Tensor> inputs;
+    for (Tensor t : scan->state_placeholder) {
+      inputs.push_back(t);
+    }
+    for (Tensor t : scan->inputs) {
+      inputs.push_back(t);
+    }
+    // Create the scan group.
+    Stage scan_group = this->create_group(scan->update, inputs, false);
+    scan_group->attach_type = kScanUpdate;
+    scan_group->attach_stage = new_stage;
+
+    for (size_t i = 0; i < scan->update.size(); ++i) {
+      Stage s = n->stage_map[scan->update[i]->op];
+      CHECK(scan_group.same_as(s->group));
+    }
+  }
+}
+
+TVM_REGISTER_GLOBAL("te.AddOperation").set_body_typed([](Schedule s, Operation op, int pos=0, bool is_output=false){
+  s.AddOperation(op, pos, is_output);
+});
+
+void Schedule::RemoveOperations(Array<Operation> ops){
+  // NOTE: I dont check these ops are not read by other ops, check it in Python, I just remove them
+  // also, make sure, you are not removing outputs
+  for(const auto& op: ops){
+    if((*this)->stage_map.find(op) != (*this)->stage_map.end()){
+      const Stage s = (*this).operator[](op);
+      (*this)->stage_map.erase(op);
+      (*this)->stages.erase(s);
+    }
+  }
+}
+
+TVM_REGISTER_GLOBAL("te.RemoveOperations").set_body_typed([](Schedule s, Array<Operation> ops){
+  s.RemoveOperations(ops);
+});
+
+
+void Schedule::ResetOperationTag(Operation op, std::string tag){
+  ComputeOpNode *n = const_cast<ComputeOpNode*>(static_cast<const ComputeOpNode*>(op.operator->()));
+  n->tag = tag;
+}
+
+TVM_REGISTER_GLOBAL("te.ResetOperationTag").set_body_typed([](Schedule s, Operation op, std::string tag){
+  s.ResetOperationTag(op, tag);
+});
+
+void Schedule::ReplaceOperation(Operation src_op, Operation tgt_op){
+  Tensor out_ts = src_op.output(0);
+  Array<Operation> post_ops;
+  for(auto &stg: (*this)->stages){
+    Operation op = stg->op;
+    // std::cout << "op inputs: " << op->name << std::endl;
+    Array<Tensor> inp_tss = op->InputTensors();
+    // std::cout << inp_tss << std::endl;
+    if(std::find(inp_tss.begin(), inp_tss.end(), out_ts) != inp_tss.end()){
+      post_ops.push_back(op);
+    }
+  }
+  Map<Tensor, Tensor> vsub;
+  vsub.Set(out_ts, tgt_op.output(0));
+  std::size_t src_pos = -1;
+  for(int i = 0; i < (*this)->stages.size(); i++){
+    auto &stg = (*this)->stages[i];
+    if(stg->op->name == src_op->name){
+      src_pos = i;
+      break;
+    }
+  }
+  // LOG(INFO) << "stages size: " << (*this)->stages.end() - (*this)->stages.begin() << "; pos: " << src_pos << std::endl;
+  Stage src_stage = (*this)->stages[src_pos];
+  Stage tgt_stage(tgt_op);
+  tgt_stage.set_scope(src_stage->scope);
+  tgt_stage->attach_type = src_stage->attach_type;
+  tgt_stage->attach_stage = src_stage->attach_stage;
+  tgt_stage->attach_ivar = src_stage->attach_ivar;
+  tgt_stage->is_output = src_stage->is_output;
+  (*this)->stages.insert((*this)->stages.begin() + src_pos, tgt_stage);
+  (*this)->stage_map.Set(tgt_op, tgt_stage);
+    
+  for(Operation post_op: post_ops){
+    bool is_output = std::find((*this)->outputs.begin(), (*this)->outputs.end(), post_op) != (*this)->outputs.end();
+
+    this->ReplaceInputs(post_op, vsub, is_output);
+  }
+  // // sync outputs ops
+  for(std::size_t i = 0; i < (*this)->outputs.size(); i++){
+    const Operation &out_op = (*this)->outputs[i];
+    for(const auto &stg: (*this)->stages){
+      if(out_op->name == stg->op->name){
+        (*this)->outputs.Set(i, stg->op);
+        // stg->is_output = true;
+        break;
+      }
+    }
+  }
+ 
+  // LOG(INFO) << "before erasing stage map" << std::endl;
+  (*this)->stage_map.erase(src_op);
+  // LOG(INFO) << "before erasing stages" << std::endl;
+  (*this)->stages.erase(src_stage);
+  // (*this)->stages.erase(src_stage);
+  // Stage src_stage = this->operator[](src_op);
+  // Stage tgt_stage(tgt_op);
+  // std::size_t src_pos = std::find((*this)->stages.begin(), (*this)->stages.end(), src_stage) - (*this)->stages.begin();
+  // if (src_op != tgt_op){
+  //   std::unordered_map<Tensor, Tensor> vmap;
+  //   std::unordered_map<Tensor, Tensor> rvmap;
+  //   vmap[src_op.output(0)] = tgt_op.output(0);
+  //   rvmap[tgt_op.output(0)] = src_op.output(0);
+  //   // (*this)->stages.insert(src_pos, tgt_stage);
+  //   ReplaceDataFlowCopy((*this), (*this)->stages, &vmap, &rvmap);
+  // }
+}
+
+TVM_REGISTER_GLOBAL("te.ReplaceOperation").set_body_typed([](Schedule s, Operation src_op, Operation repl_op){
+  s.ReplaceOperation(src_op, repl_op);
+});
+
+Operation OperationMake(Array<PrimExpr> shape, Array<PrimExpr> body, std::string name, std::string tag,
+               Map<String, ObjectRef> attrs) {
+  auto op_node = make_object<ComputeOpNode>();
+  // compute dimension.
+  size_t ndim = shape.size();
+  std::vector<IterVar> axis;
+  std::vector<Var> args;
+  for (size_t i = 0; i < ndim; ++i) {
+    std::ostringstream os;
+    os << "ax" << i;
+    auto ivar_node = make_object<IterVarNode>();
+    ivar_node->dom = Range(0, shape[i]);
+    ivar_node->var = Var(os.str(), shape[i].dtype());
+    ivar_node->iter_type = kDataPar;
+    axis.emplace_back(ivar_node);
+    args.push_back(axis.back()->var);
+  }
+  op_node->name = name;
+  op_node->tag = tag;
+  op_node->axis = std::move(axis);
+  if (body[0]->IsInstance<tir::ReduceNode>()) {
+    const tir::ReduceNode* reduce = body[0].as<tir::ReduceNode>();
+    for(const auto &axis: reduce->axis){
+      op_node->reduce_axis.push_back(axis);
+    }
+  }
+  op_node->body = std::move(body);
+
+  auto op = Operation(std::move(op_node));
+  return op;
+}
+
+Operation Schedule::ReplaceOperationWithNewShape(Operation src_op, Array<PrimExpr> new_shape, bool is_output){
+
+  // generate the replace op
+  ComputeOpNode* src_node = const_cast<ComputeOpNode*>(static_cast<const ComputeOpNode*>((src_op.operator->())));
+  // src_node->output_shape_override.clear();
+  // for(const auto& pe: new_shape){
+  //   src_node->output_shape_override.push_back(pe);
+  // }
+  // return src_op;
+
+  Operation repl_op = OperationMake(new_shape, src_node->body, src_op->name, src_op->tag, src_op->attrs);
+  // replace the src op in stages
+  // src_stage->op = repl_op;
+  // (*this)->stage_map.erase(src_op);
+  // (*this)->stage_map.Set(repl_op, src_stage);
+  // if (is_output){
+  //   Stage src_stage = this->operator[](src_op);
+  //   // for(Stage orig_s: (*this)->stages){
+  //   //   orig_s->is_output = false;
+  //   // }
+  //   // src_stage->is_output = true;
+  //   ScheduleNode * n = (*this).operator->();
+  //   size_t i = 0;
+  //   for(; i < n->outputs.size(); i++){
+  //     if(n->outputs[i] == src_op){
+  //       break;
+  //     }
+  //   }
+    
+  //   n->outputs.Set(i, repl_op);
+  // }
+  // LOG(INFO) << "replace operation: " << src_op->name << std::endl;
+  ReplaceOperation(src_op, repl_op);
+  return repl_op;
+}
+
+TVM_REGISTER_GLOBAL("te.ReplaceOperationWithNewShape")
+  .set_body_typed([](Schedule s, Operation op, Array<PrimExpr> shape, bool is_output){
+  return s.ReplaceOperationWithNewShape(op, shape, is_output);
+});
+
 
 }  // namespace te
 }  // namespace tvm

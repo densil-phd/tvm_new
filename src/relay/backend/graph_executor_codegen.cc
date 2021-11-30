@@ -61,6 +61,7 @@ using GraphAttrs = std::unordered_map<std::string, dmlc::any>;
 using GraphObjectPtr = std::shared_ptr<GraphNode>;
 using GraphInputObjectPtr = std::shared_ptr<GraphInputNode>;
 using GraphOpObjectPtr = std::shared_ptr<GraphOpNode>;
+using TargetsMap = std::unordered_map<int, Target>;
 
 /*! \brief Node types */
 enum GraphNodeType {

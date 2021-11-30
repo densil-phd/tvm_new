@@ -374,6 +374,13 @@ class BufferRealizeNode : public StmtNode {
                     Span span = Span())
       : StmtNode(span), buffer(buffer), bounds(bounds), condition(condition), body(body) {}
 
+  void AlterBoundsWithMinExtents(Array<PrimExpr> &mins, Array<PrimExpr> &extents){
+    this->bounds.clear();
+    for(std::size_t i = 0; i < mins.size(); i ++){
+      this->bounds.push_back(Range::FromMinExtent(mins[i], extents[i]));
+    }
+  }
+  
   static constexpr const char* _type_key = "tir.BufferRealize";
   TVM_DECLARE_FINAL_OBJECT_INFO(BufferRealizeNode, StmtNode);
 };

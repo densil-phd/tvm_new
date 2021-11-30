@@ -452,19 +452,33 @@ class RelayBuildModule : public runtime::ModuleNode {
     }
 
     // When there is no lowered_funcs due to reasons such as optimization.
-    if (lowered_funcs.size() == 0) {
-      if (host_target->kind->name == "llvm") {
-        CHECK(pf != nullptr) << "Unable to create empty module for llvm without llvm codegen.";
-        // If we can decide the target is LLVM, we then create an empty LLVM module.
-        ret_.mod = (*pf)(host_target->str(), "empty_module");
-      } else {
-        // If we cannot decide the target is LLVM, we create an empty CSourceModule.
-        // The code content is initialized with ";" to prevent complaining
-        // from CSourceModuleNode::SaveToFile.
-        ret_.mod = tvm::codegen::CSourceModuleCreate(";", "", Array<String>{});
+    // if (lowered_funcs.size() == 0) {
+    //   if (host_target->kind->name == "llvm") {
+    //     CHECK(pf != nullptr) << "Unable to create empty module for llvm without llvm codegen.";
+    //     // If we can decide the target is LLVM, we then create an empty LLVM module.
+    //     ret_.mod = (*pf)(host_target->str(), "empty_module");
+    //   } else {
+    //     // If we cannot decide the target is LLVM, we create an empty CSourceModule.
+    //     // The code content is initialized with ";" to prevent complaining
+    //     // from CSourceModuleNode::SaveToFile.
+    //     ret_.mod = tvm::codegen::CSourceModuleCreate(";", "", Array<String>{});
+    //   }
+    bool is_alt_optimizing = backend::IsALTOptimizing();
+    // save some time
+    if (!is_alt_optimizing){
+      // When there is no lowered_funcs due to reasons such as optimization.
+      if (lowered_funcs.size() == 0) {
+        if (host_target.defined() && host_target->kind->name == "llvm") {
+          // If we can decide the target is LLVM, we then create an empty LLVM module.
+          ret_.mod = (*pf)(host_target->str(), "empty_module");
+        } else {
+          // If we cannot decide the target is LLVM, we create an empty CSourceModule.
+          // The code content is initialized with ";" to prevent complaining
+          // from CSourceModuleNode::SaveToFile.
+          // ret_.mod = tvm::codegen::CSourceModuleCreate(";", "", Array<String>{});
+          ret_.mod = tvm::build(lowered_funcs, host_target);
+        }
       }
-    } else {
-      ret_.mod = tvm::build(lowered_funcs, host_target);
     }
 
     auto ext_mods = executor_codegen_->GetExternalModules();
