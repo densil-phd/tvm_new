@@ -208,6 +208,7 @@ class TECompilerImpl : public TECompilerNode {
             << PrettyPrint(key->source_func) << std::endl
             << "for target:" << std::endl
             << key->target->ToDebugString();
+    bool use_alt = backend::IsALTEnabled();
     std::lock_guard<std::mutex> lock(mutex_);
     CCacheValue value;
     auto it = cache_.find(key);
@@ -359,6 +360,8 @@ TECompiler& TECompiler::Global() {
 }
 TVM_REGISTER_PASS_CONFIG_OPTION("relay.backend.use_auto_scheduler", Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION("relay.backend.use_meta_schedule", Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION("relay.backend.alt_optimizing", Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION("relay.backend.use_alt", Bool);
 
 TVM_REGISTER_GLOBAL("relay.backend._TECompilerGlobal").set_body_typed([]() {
   return TECompiler::Global();

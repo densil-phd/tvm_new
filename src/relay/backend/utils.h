@@ -430,6 +430,18 @@ inline bool IsAutoSchedulerEnabled() {
       .value();
 }
 
+inline bool IsALTEnabled(){
+  return transform::PassContext::Current()
+    ->GetConfig<Bool>("relay.backend.use_alt", Bool(false))
+    .value();
+}
+
+inline bool IsALTOptimizing(){
+  return transform::PassContext::Current()
+    ->GetConfig<Bool>("relay.backend.alt_optimizing", Bool(false))
+    .value();
+}
+
 /*!
  * \brief Return whether the meta schedule is enabled in the pass context.
  */

@@ -630,6 +630,11 @@ TVM_REGISTER_GLOBAL("tir.BufferRealize")
 
 TVM_REGISTER_NODE_TYPE(BufferRealizeNode);
 
+TVM_REGISTER_GLOBAL("tir.AlterBoundsWithMinExtents").set_body_typed([](BufferRealize self, Array<PrimExpr> mins, Array<PrimExpr> extents){
+  BufferRealizeNode *brn = const_cast<BufferRealizeNode*>(self.operator->());
+  brn->AlterBoundsWithMinExtents(mins, extents);
+});
+
 TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
     .set_dispatch<BufferRealizeNode>([](const ObjectRef& node, ReprPrinter* p) {
       auto* op = static_cast<const BufferRealizeNode*>(node.get());

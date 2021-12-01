@@ -270,6 +270,9 @@ class BufferRealize(Stmt):
         self.__init_handle_by_constructor__(
             _ffi_api.BufferRealize, buffer, bounds, condition, body, span  # type: ignore
         )
+        
+    def alter_bounds_with_min_extents(self, mins, extents):
+        _ffi_api.AlterBoundsWithMinExtents(self, mins, extents)
 
 
 @tvm._ffi.register_object("tir.ProducerStore")

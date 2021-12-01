@@ -144,6 +144,14 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
       p->stream << "TensorIntrinCall(intrin=" << n->intrin << ", " << n << ")";
     });
 
+TVM_REGISTER_GLOBAL("te.OpReplaceInputs").set_body_typed([](Operation self, Map<Tensor, Tensor> vmap){
+  std::unordered_map<Tensor, Tensor> uvmap;
+  for(const auto&kv: vmap){
+    uvmap[kv.first] = kv.second;
+  }
+  return self->ReplaceInputs(self, uvmap);
+});
+
 TVM_REGISTER_NODE_TYPE(TensorIntrinCallNode);
 
 // Other tensor ops.
